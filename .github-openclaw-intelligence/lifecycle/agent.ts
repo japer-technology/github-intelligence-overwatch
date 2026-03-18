@@ -15,9 +15,12 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Workflow step order:
  *   1. Authorize   (inline shell)            — auth check + add 🚀 reaction indicator
- *   2. Install     (bun install)            — install npm/bun dependencies
- *   3. Build       (bun run build)          — compile OpenClaw TypeScript
- *   4. Run         (agent.ts)               ← YOU ARE HERE
+ *   2. Checkout    (actions/checkout)         — clone the repository
+ *   3. Guard       (enabled.ts)              — verify ENABLED.md sentinel exists
+ *   4. Preflight   (preflight.ts)            — validate config and structural integrity
+ *   5. Install     (bun install)             — install npm/bun dependencies
+ *   6. Build       (bun run build)           — compile (no-op for Bun/TS)
+ *   7. Run         (agent.ts)                ← YOU ARE HERE
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * AGENT EXECUTION PIPELINE
@@ -83,6 +86,8 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, symlinkSync } from "fs";
 import { resolve } from "path";
+import { parseCommand, isMutationInvocation, SUPPORTED_COMMANDS } from "./command-parser";
+import { resolveTrustLevel, type TrustPolicy } from "./trust-level";
 
 // ─── Paths and event context ───────────────────────────────────────────────────
 // `import.meta.dir` resolves to `.github-openclaw-intelligence/lifecycle/`; stepping up one level
@@ -184,6 +189,15 @@ if (configuredModel.trim() !== configuredModel || /\s/.test(configuredModel)) {
 }
 
 console.log(`Configured provider: ${configuredProvider}, model: ${configuredModel}${configuredThinking ? `, thinking: ${configuredThinking}` : ""}`);
+
+// ─── Trust policy and limits ─────────────────────────────────────────────────
+// Read the trustPolicy and limits sections from settings.json.  These control
+// per-actor capability gating and resource boundaries respectively.
+const trustPolicy: TrustPolicy | undefined = piSettings.trustPolicy;
+const configuredLimits: { maxTokensPerRun?: number; maxToolCallsPerRun?: number; workflowTimeoutMinutes?: number } | undefined = piSettings.limits;
+
+// The GitHub actor who triggered the workflow.
+const actor: string = process.env.GITHUB_ACTOR ?? "";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -312,10 +326,9 @@ function linkBundledSkills(allowBundled: string[]): void {
  * Returns `{ skillName, remainder }` if a skill invocation was detected,
  * or `null` if the prompt does not start with a `/skill-name` pattern.
  *
- * Examples:
- *   "@ /gh-issues owner/repo --label bug"  → { skillName: "gh-issues", remainder: "owner/repo --label bug" }
- *   "@ /weather London"                    → { skillName: "weather", remainder: "London" }
- *   "@ Tell me about X"                    → null
+ * This is a fallback for skill-specific slash commands that are NOT in the
+ * SUPPORTED_COMMANDS registry (e.g. `/weather`, `/gh-issues`).  Known
+ * commands are handled by the command parser.
  */
 function parseSkillInvocation(prompt: string): { skillName: string; remainder: string } | null {
   const match = prompt.match(/^\s*\/([a-zA-Z0-9_-]+)\s*(.*)/s);
@@ -355,15 +368,73 @@ try {
     prompt = `${title.replace(/^@\s*/, "")}\n\n${body}`;
   }
 
-  // ── Parse skill invocation from prompt ──────────────────────────────────────
-  // If the prompt starts with `/skill-name`, extract the skill name and rewrite
-  // the prompt so OpenClaw invokes the named skill.  For example:
-  //   "@ /gh-issues owner/repo --label bug"  → skill "gh-issues", prompt "owner/repo --label bug"
-  //   "@ /weather London"                    → skill "weather", prompt "London"
-  const skillInvocation = parseSkillInvocation(prompt);
-  if (skillInvocation) {
-    console.log(`Skill invocation detected: /${skillInvocation.skillName}`);
-    prompt = `Use the "${skillInvocation.skillName}" skill to: ${skillInvocation.remainder}`;
+  // ── Resolve trust level for the actor ─────────────────────────────────────
+  // Read the actor's repository permission from the reaction-state metadata
+  // written by the Authorize workflow step.  If unavailable, default to "write"
+  // since the Authorize step already verified at least write-level access.
+  const actorPermission: string = reactionState?.actorPermission ?? "write";
+  const actorTrustLevel = resolveTrustLevel(actor, actorPermission, trustPolicy);
+  console.log(`Trust level for ${actor} (${actorPermission}): ${actorTrustLevel}`);
+
+  // ── Parse command from prompt ─────────────────────────────────────────────
+  // Use the command parser to detect slash commands (e.g. `/status`, `/help`,
+  // `/config set provider openai`).  Falls back to skill invocation or plain
+  // agent mode for unrecognised commands.
+  const parsed = parseCommand(prompt);
+
+  if (parsed.command !== "agent" && parsed.command in SUPPORTED_COMMANDS) {
+    console.log(`Command detected: /${parsed.command} ${parsed.args.join(" ")}`);
+
+    // Trust-level gating: block mutation commands for non-trusted actors.
+    if (actorTrustLevel !== "trusted" && isMutationInvocation(parsed.command, parsed.args)) {
+      const blockMsg =
+        `⚠️ **Permission denied**: The \`/${parsed.command}\` command requires trusted-level access.\n\n` +
+        `Your trust level is \`${actorTrustLevel}\`. Contact a repository administrator to ` +
+        `add your username to the \`trustPolicy.trustedUsers\` list in \`.pi/settings.json\`.`;
+      await gh("issue", "comment", String(issueNumber), "--body", blockMsg);
+      throw new Error(`Mutation command /${parsed.command} blocked for ${actorTrustLevel} actor ${actor}`);
+    }
+
+    // Handle known informational commands that don't need the full agent.
+    if (parsed.command === "help") {
+      const helpLines = Object.entries(SUPPORTED_COMMANDS)
+        .map(([name, desc]) => `- \`/${name}\` — ${desc.description}`)
+        .join("\n");
+      await gh("issue", "comment", String(issueNumber), "--body",
+        `## Available Commands\n\n${helpLines}\n\n` +
+        `Commands prefixed with \`/\` are processed directly. All other text is sent to the agent as natural language.`);
+      // Mark success and add outcome reaction before exiting early.
+      // We do this here rather than relying on the finally block because
+      // process.exit() would bypass it.
+      succeeded = true;
+      if (reactionState) {
+        try {
+          const { reactionTarget, commentId: stateCommentId } = reactionState;
+          if (reactionTarget === "comment" && stateCommentId) {
+            await gh("api", `repos/${repo}/issues/comments/${stateCommentId}/reactions`, "-f", "content=+1");
+          } else {
+            await gh("api", `repos/${repo}/issues/${issueNumber}/reactions`, "-f", "content=+1");
+          }
+        } catch { /* reaction failure is non-fatal */ }
+      }
+      process.exit(0);
+    }
+
+    // Rewrite the prompt so the agent receives the command context.
+    prompt = `Execute the OpenClaw "${parsed.command}" command with arguments: ${parsed.args.join(" ")}.\n\nOriginal input: ${parsed.rawText}`;
+  } else {
+    // ── Parse skill invocation from prompt ────────────────────────────────────
+    // If the prompt starts with `/skill-name`, extract the skill name and rewrite
+    // the prompt so OpenClaw invokes the named skill.  For example:
+    //   "@ /gh-issues owner/repo --label bug"  → skill "gh-issues", prompt "owner/repo --label bug"
+    //   "@ /weather London"                    → skill "weather", prompt "London"
+    // This also handles unknown slash commands that are not in SUPPORTED_COMMANDS
+    // but may be valid skill names (e.g. /weather, /gh-issues, /xurl).
+    const skillInvocation = parseSkillInvocation(prompt);
+    if (skillInvocation) {
+      console.log(`Skill invocation detected: /${skillInvocation.skillName}`);
+      prompt = `Use the "${skillInvocation.skillName}" skill to: ${skillInvocation.remainder}`;
+    }
   }
 
   // ── Load skills configuration and link bundled skills ──────────────────────
@@ -487,9 +558,10 @@ try {
   // ── Run the OpenClaw agent ───────────────────────────────────────────────────
   // Use `openclaw agent --local` for embedded execution without a Gateway.
   // The --json flag provides structured output for response extraction.
-  // The --model and --provider flags are passed explicitly from the committed
-  // `.pi/settings.json` to prevent provider/model drift from any host-level
-  // OpenClaw configuration that may be present on the runner image.
+  // The model and provider are set via the runtime config (agents.defaults.model)
+  // using `provider/model` format, from the committed `.pi/settings.json`, to
+  // prevent provider/model drift from any host-level OpenClaw configuration that
+  // may be present on the runner image.
   // Pipe agent output through `tee` so we get:
   //   • a live stream to stdout (visible in the Actions log in real time), and
   //   • a persisted copy at `/tmp/agent-raw.json` for post-processing below.
@@ -499,10 +571,6 @@ try {
     "agent",
     "--local",
     "--json",
-    "--model",
-    configuredModel,
-    "--provider",
-    configuredProvider,
     "--message",
     prompt,
     "--thinking",
@@ -517,8 +585,9 @@ try {
   // sqlite, caches) is kept inside .github-openclaw-intelligence/state/ via OPENCLAW_STATE_DIR.
   // The skills section enables bundled skills listed in config/skills.json and
   // adds the local skills/ directory as an extra search path.
-  // The extensions section forwards config/extensions.json so the OpenClaw runtime
-  // activates the full set of capabilities (sub-agents, semantic-memory, browser-cdp, etc.).
+  // Extensions from config/extensions.json are logged above for visibility but are
+  // NOT forwarded to the runtime config — the OpenClaw schema does not accept an
+  // "extensions" top-level key and will reject the config with a validation error.
   const extraDirs = [
     skillsDir,
     ...(skillsConfig.skills?.load?.extraDirs ?? []),
@@ -529,6 +598,7 @@ try {
       defaults: {
         workspace: repoRoot,
         timeoutSeconds: 600,
+        model: `${configuredProvider}/${configuredModel}`,
       },
     },
     skills: {
@@ -537,7 +607,6 @@ try {
         extraDirs,
       },
     },
-    extensions,
   };
   const runtimeConfigPath = "/tmp/openclaw-runtime.json";
   writeFileSync(runtimeConfigPath, JSON.stringify(runtimeConfig, null, 2));
@@ -679,10 +748,24 @@ try {
   // possible, before the potentially slow git push operation.
   // Guard against empty/null responses — post an error message instead of silence.
   const trimmedText = agentText.trim();
-  const commentBody = trimmedText.length > 0
-    ? trimmedText.slice(0, MAX_COMMENT_LENGTH)
-    : `✅ The agent ran successfully but did not produce a text response. Check the repository for any file changes that were made.\n\nFor full details, see the [workflow run logs](https://github.com/${repo}/actions).`;
-  await gh("issue", "comment", String(issueNumber), "--body", commentBody);
+  let commentBody: string;
+  if (trimmedText.length === 0) {
+    commentBody = `✅ The agent ran successfully but did not produce a text response. Check the repository for any file changes that were made.\n\nFor full details, see the [workflow run logs](https://github.com/${repo}/actions).`;
+  } else if (trimmedText.length > MAX_COMMENT_LENGTH) {
+    const truncationNotice =
+      `\n\n---\n⚠️ **Response truncated** — the full response was ${trimmedText.length.toLocaleString()} characters, which exceeds GitHub's comment limit. See the [workflow run logs](https://github.com/${repo}/actions) for the complete output.`;
+    commentBody = trimmedText.slice(0, MAX_COMMENT_LENGTH - truncationNotice.length) + truncationNotice;
+  } else {
+    commentBody = trimmedText;
+  }
+
+  // Wrap the comment posting in try/catch so that a failure to post the reply
+  // does not prevent session state from being committed and pushed.
+  try {
+    await gh("issue", "comment", String(issueNumber), "--body", commentBody);
+  } catch (commentErr) {
+    console.error(`Failed to post reply comment on issue #${issueNumber}:`, commentErr);
+  }
 
   // ── Commit and push state changes ───────────────────────────────────────────
   // Stage all changes (session log, mapping JSON, any files the agent edited),
