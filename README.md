@@ -1,9 +1,13 @@
 # github-intelligence-overwatch
 
+## Organisation-wide control for all repositories
+
+#### Full control of all repos.
+
 <p align="center">
   <picture>
     <img src="https://raw.githubusercontent.com/japer-technology/github-intelligence-overwatch/main/GITHUB-CAT-BORG.png" alt="Intelligence Overwatch" width="500">
   </picture>
 </p>
 
-> A PAT with unlimited access allows overwatch to be all powerful.
+> This overwatch is all powerful due to a single unhindered PAT.
