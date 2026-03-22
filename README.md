@@ -2,7 +2,7 @@
 
 ## Organisation-wide control for all repositories
 
-#### Full control of all repos.
+#### Full control of all repos, now with cron!
 
 <p align="center">
   <picture>
